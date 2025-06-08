@@ -22,11 +22,19 @@ export interface LlamaResponse {
   };
 }
 
+interface ModelInfo {
+  hasChatTemplate: boolean;
+  modelType: 'croissant' | 'phi3' | 'generic';
+  defaultParams: Partial<ModelParams>;
+  stopSequences: string[];
+}
+
 class LlamaService {
   private static instance: LlamaService;
   private modelService = ModelService.getInstance();
   private llamaCppPath: string;
   private currentProcess?: ChildProcess;
+  private modelInfo?: ModelInfo;
 
   constructor() {
     this.llamaCppPath = process.env.LLAMA_CPP_PATH || 'llama-cpp';
@@ -39,8 +47,50 @@ class LlamaService {
     return LlamaService.instance;
   }
 
+  private detectModelType(modelPath: string): ModelInfo {
+    const modelName = modelPath.toLowerCase();
+    
+    if (modelName.includes('croissant')) {
+      return {
+        hasChatTemplate: true,
+        modelType: 'croissant',
+        defaultParams: {
+          temperature: 0.3, // Minimum recommandé pour CroissantLLM
+          topP: 0.9,
+          repeatPenalty: 1.05,
+          contextSize: 2048, // Taille d'entraînement du modèle
+        },
+        stopSequences: ['<|im_end|>', 'User:', 'Human:']
+      };
+    } else if (modelName.includes('phi') || modelName.includes('phi3')) {
+      return {
+        hasChatTemplate: false,
+        modelType: 'phi3',
+        defaultParams: {
+          temperature: 0.7,
+          topP: 0.9,
+          repeatPenalty: 1.1,
+          contextSize: 4096,
+        },
+        stopSequences: ['User:', 'Human:', '<|endoftext|>', '</s>']
+      };
+    } else {
+      return {
+        hasChatTemplate: false,
+        modelType: 'generic',
+        defaultParams: {
+          temperature: 0.7,
+          topP: 0.9,
+          repeatPenalty: 1.1,
+          contextSize: 2048,
+        },
+        stopSequences: ['User:', 'Human:', '<|endoftext|>', '</s>']
+      };
+    }
+  }
+
   private getDefaultParams(): ModelParams {
-    return {
+    const baseParams = {
       temperature: parseFloat(process.env.PHI3_TEMPERATURE || '0.7'),
       maxTokens: parseInt(process.env.PHI3_MAX_TOKENS || '2048'),
       topP: 0.9,
@@ -48,6 +98,13 @@ class LlamaService {
       contextSize: 4096,
       seed: -1
     };
+
+    // Fusionner avec les paramètres spécifiques au modèle
+    if (this.modelInfo?.defaultParams) {
+      return { ...baseParams, ...this.modelInfo.defaultParams };
+    }
+
+    return baseParams;
   }
 
   private buildArgs(prompt: string, params: ModelParams): string[] {
@@ -56,9 +113,17 @@ class LlamaService {
       throw new Error('Aucun modèle actif. Veuillez activer un modèle.');
     }
 
+    // Détecter le type de modèle si pas encore fait
+    if (!this.modelInfo) {
+      this.modelInfo = this.detectModelType(modelPath);
+      logger.info('Model detected', { 
+        type: this.modelInfo.modelType, 
+        hasChatTemplate: this.modelInfo.hasChatTemplate 
+      });
+    }
+
     const args: string[] = [
       '-m', modelPath,
-      '-p', prompt,
       '-c', params.contextSize.toString(),
       '-n', params.maxTokens.toString(),
       '--temp', params.temperature.toString(),
@@ -66,6 +131,15 @@ class LlamaService {
       '--repeat-penalty', params.repeatPenalty.toString(),
       '--no-display-prompt'
     ];
+
+    // Mode conversation pour les modèles avec chat template
+    if (this.modelInfo.hasChatTemplate) {
+      args.push('-cnv'); // Active le mode conversation
+      // Pour les modèles avec chat template, on envoie le message via stdin
+    } else {
+      // Mode prompt classique pour les autres modèles
+      args.push('-p', prompt);
+    }
 
     if (params.seed !== -1) {
       args.push('--seed', params.seed.toString());
@@ -75,6 +149,14 @@ class LlamaService {
   }
 
   private buildPrompt(message: string, preprompt?: string, history?: ChatMessage[]): string {
+    // Si le modèle a un chat template, on laisse llama.cpp le gérer
+    if (this.modelInfo?.hasChatTemplate) {
+      // Pour les modèles CroissantLLM, on retourne juste le message
+      // Le template sera appliqué automatiquement par llama.cpp
+      return message;
+    }
+
+    // Pour les modèles sans chat template (Phi-3, etc.)
     let prompt = '';
     
     // Ajouter le preprompt si fourni
@@ -99,13 +181,23 @@ class LlamaService {
   private processResponse(rawResponse: string): string {
     let processed = rawResponse.trim();
     
-    // Supprimer les séquences d'arrêt communes
-    const stopSequences = ['User:', 'Human:', '<|endoftext|>', '</s>', '<s>'];
+    // Utiliser les séquences d'arrêt spécifiques au modèle
+    const stopSequences = this.modelInfo?.stopSequences || 
+      ['User:', 'Human:', '<|endoftext|>', '</s>', '<s>'];
+    
     for (const seq of stopSequences) {
       const index = processed.indexOf(seq);
       if (index !== -1) {
         processed = processed.substring(0, index).trim();
       }
+    }
+
+    // Nettoyer les artefacts spécifiques aux modèles avec chat template
+    if (this.modelInfo?.hasChatTemplate) {
+      // Supprimer les tags résiduels
+      processed = processed.replace(/<\|im_start\|>/g, '');
+      processed = processed.replace(/<\|im_end\|>/g, '');
+      processed = processed.replace(/^assistant\s*/i, '');
     }
 
     return processed;
@@ -123,7 +215,9 @@ class LlamaService {
     logger.info('Starting llama.cpp generation', {
       promptLength: fullPrompt.length,
       params,
-      timeout
+      timeout,
+      modelType: this.modelInfo?.modelType,
+      hasChatTemplate: this.modelInfo?.hasChatTemplate
     });
 
     return new Promise<ChatResponse>((resolve, reject) => {
@@ -156,6 +250,18 @@ class LlamaService {
         }
       };
 
+      // Pour les modèles avec chat template, envoyer le message via stdin
+      if (this.modelInfo?.hasChatTemplate && llamaProcess.stdin) {
+        // Envoyer le message en mode interactif
+        llamaProcess.stdin.write(fullPrompt + '\n');
+        // Attendre un peu puis terminer l'input
+        setTimeout(() => {
+          if (llamaProcess.stdin) {
+            llamaProcess.stdin.end();
+          }
+        }, 100);
+      }
+
       // Traiter la sortie stdout
       llamaProcess.stdout?.on('data', (data: Buffer) => {
         const chunk = data.toString();
@@ -180,7 +286,14 @@ class LlamaService {
       llamaProcess.stderr?.on('data', (data: Buffer) => {
         const chunk = data.toString();
         errorOutput += chunk;
-        logger.warn('llama.cpp stderr:', chunk.substring(0, 100));
+        
+        // Filtrer les logs verbeux de llama.cpp
+        if (!chunk.includes('load_tensors:') && 
+            !chunk.includes('llama_model_loader:') &&
+            !chunk.includes('print_info:') &&
+            !chunk.includes('load_backend:')) {
+          logger.warn('llama.cpp stderr:', chunk.substring(0, 100));
+        }
       });
 
       // Gérer la fermeture du processus
@@ -225,7 +338,8 @@ class LlamaService {
   }
 
   private containsStopSequence(text: string): boolean {
-    const stopSequences = ['User:', 'Human:', '<|endoftext|>', '</s>'];
+    const stopSequences = this.modelInfo?.stopSequences || 
+      ['User:', 'Human:', '<|endoftext|>', '</s>'];
     return stopSequences.some(seq => text.includes(seq));
   }
 
@@ -271,10 +385,18 @@ class LlamaService {
     return {
       isLoaded: !!activeModel,
       modelName: activeModel ? activeModel.split('/').pop() : 'None',
-      version: 'llama.cpp',
+      modelType: this.modelInfo?.modelType || 'unknown',
+      hasChatTemplate: this.modelInfo?.hasChatTemplate || false,
+      version: 'llama.cpp adaptive',
       lastRequest: new Date(),
       isGenerating: !!this.currentProcess
     };
+  }
+
+  // Méthode pour forcer la redétection du modèle (utile lors du changement de modèle)
+  resetModelInfo(): void {
+    this.modelInfo = undefined;
+    logger.info('Model info reset, will be detected on next generation');
   }
 }
 
