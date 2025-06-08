@@ -27,6 +27,7 @@ interface ModelInfo {
   modelType: 'croissant' | 'phi3' | 'generic';
   defaultParams: Partial<ModelParams>;
   stopSequences: string[];
+  interactiveMode: boolean;
 }
 
 class LlamaService {
@@ -55,12 +56,13 @@ class LlamaService {
         hasChatTemplate: true,
         modelType: 'croissant',
         defaultParams: {
-          temperature: 0.3, // Minimum recommandé pour CroissantLLM
+          temperature: 0.3,
           topP: 0.9,
           repeatPenalty: 1.05,
-          contextSize: 2048, // Taille d'entraînement du modèle
+          contextSize: 2048,
         },
-        stopSequences: ['<|im_end|>', 'User:', 'Human:']
+        stopSequences: ['<|im_end|>', 'User:', 'Human:'],
+        interactiveMode: true // CroissantLLM se met automatiquement en mode conversation
       };
     } else if (modelName.includes('phi') || modelName.includes('phi3')) {
       return {
@@ -72,7 +74,8 @@ class LlamaService {
           repeatPenalty: 1.1,
           contextSize: 4096,
         },
-        stopSequences: ['User:', 'Human:', '<|endoftext|>', '</s>']
+        stopSequences: ['User:', 'Human:', '<|endoftext|>', '</s>'],
+        interactiveMode: false
       };
     } else {
       return {
@@ -84,7 +87,8 @@ class LlamaService {
           repeatPenalty: 1.1,
           contextSize: 2048,
         },
-        stopSequences: ['User:', 'Human:', '<|endoftext|>', '</s>']
+        stopSequences: ['User:', 'Human:', '<|endoftext|>', '</s>'],
+        interactiveMode: false
       };
     }
   }
@@ -99,7 +103,6 @@ class LlamaService {
       seed: -1
     };
 
-    // Fusionner avec les paramètres spécifiques au modèle
     if (this.modelInfo?.defaultParams) {
       return { ...baseParams, ...this.modelInfo.defaultParams };
     }
@@ -113,12 +116,12 @@ class LlamaService {
       throw new Error('Aucun modèle actif. Veuillez activer un modèle.');
     }
 
-    // Détecter le type de modèle si pas encore fait
     if (!this.modelInfo) {
       this.modelInfo = this.detectModelType(modelPath);
       logger.info('Model detected', { 
         type: this.modelInfo.modelType, 
-        hasChatTemplate: this.modelInfo.hasChatTemplate 
+        hasChatTemplate: this.modelInfo.hasChatTemplate,
+        interactiveMode: this.modelInfo.interactiveMode
       });
     }
 
@@ -132,11 +135,11 @@ class LlamaService {
       '--no-display-prompt'
     ];
 
-    // Pour TOUS les modèles : utiliser le mode prompt avec template intégré
-    args.push('-p', prompt);
-
-    // Désactiver explicitement le mode conversation interactif
-    args.push('--no-cnv');
+    // Pour les modèles qui n'ont PAS de mode interactif automatique
+    if (!this.modelInfo.interactiveMode) {
+      args.push('-p', prompt);
+    }
+    // Pour les modèles avec mode interactif (CroissantLLM), on envoie le message via stdin
 
     if (params.seed !== -1) {
       args.push('--seed', params.seed.toString());
@@ -146,16 +149,13 @@ class LlamaService {
   }
 
   private buildPrompt(message: string, preprompt?: string, history?: ChatMessage[]): string {
-    // Construire le prompt avec le template CroissantLLM manuellement
     if (this.modelInfo?.hasChatTemplate) {
       let prompt = '';
       
-      // Ajouter le preprompt comme message système si fourni
       if (preprompt?.trim()) {
         prompt += `<|im_start|>system\n${preprompt.trim()}<|im_end|>\n`;
       }
 
-      // Ajouter l'historique si fourni
       if (history && history.length > 0) {
         for (const msg of history.slice(-10)) {
           const role = msg.role === 'user' ? 'user' : 'assistant';
@@ -163,13 +163,12 @@ class LlamaService {
         }
       }
 
-      // Ajouter le message actuel
       prompt += `<|im_start|>user\n${message}<|im_end|>\n<|im_start|>assistant\n`;
       
       return prompt;
     }
 
-    // Pour les modèles sans chat template (Phi-3, etc.)
+    // Pour les modèles sans chat template
     let prompt = '';
     
     if (preprompt?.trim()) {
@@ -191,7 +190,6 @@ class LlamaService {
   private processResponse(rawResponse: string): string {
     let processed = rawResponse.trim();
     
-    // Utiliser les séquences d'arrêt spécifiques au modèle
     const stopSequences = this.modelInfo?.stopSequences || 
       ['User:', 'Human:', '<|endoftext|>', '</s>', '<s>'];
     
@@ -202,22 +200,23 @@ class LlamaService {
       }
     }
 
-    // Nettoyer les artefacts spécifiques aux modèles avec chat template
     if (this.modelInfo?.hasChatTemplate) {
-      // Supprimer les tags résiduels
       processed = processed.replace(/<\|im_start\|>/g, '');
       processed = processed.replace(/<\|im_end\|>/g, '');
       processed = processed.replace(/^assistant\s*/i, '');
+      
+      // Nettoyer les prompts résiduels du mode interactif
+      processed = processed.replace(/^<\|im_start\|>\s*user[\s\S]*?<\|im_end\|>/gm, '');
+      processed = processed.replace(/^>\s*/gm, ''); // Supprimer les ">" de prompt
     }
 
-    return processed;
+    return processed.trim();
   }
 
   async generateResponse(request: ChatRequest, preprompt?: string, modelParams?: Partial<ModelParams>): Promise<ChatResponse> {
     const startTime = Date.now();
     const params = { ...this.getDefaultParams(), ...modelParams };
     
-    // Construire le prompt complet
     const fullPrompt = this.buildPrompt(request.message, preprompt, request.history);
     const args = this.buildArgs(fullPrompt, params);
     const timeout = Math.max(30000, params.maxTokens * 100);
@@ -227,7 +226,8 @@ class LlamaService {
       params,
       timeout,
       modelType: this.modelInfo?.modelType,
-      hasChatTemplate: this.modelInfo?.hasChatTemplate
+      hasChatTemplate: this.modelInfo?.hasChatTemplate,
+      interactiveMode: this.modelInfo?.interactiveMode
     });
 
     return new Promise<ChatResponse>((resolve, reject) => {
@@ -235,6 +235,7 @@ class LlamaService {
       let errorOutput = '';
       let chunkCount = 0;
       let responseSent = false;
+      let isInteractiveMode = false;
 
       const llamaProcess: ChildProcess = spawn(this.llamaCppPath, args);
       this.currentProcess = llamaProcess;
@@ -263,12 +264,44 @@ class LlamaService {
       // Traiter la sortie stdout
       llamaProcess.stdout?.on('data', (data: Buffer) => {
         const chunk = data.toString();
-        response += chunk;
-        chunkCount++;
+        
+        // Détecter si llama.cpp est passé en mode interactif
+        if (chunk.includes('interactive mode on') || chunk.includes('> ')) {
+          isInteractiveMode = true;
+          logger.info('Interactive mode detected, sending message via stdin');
+          
+          // Envoyer le message dans le mode interactif
+          if (llamaProcess.stdin) {
+            llamaProcess.stdin.write(request.message + '\n');
+          }
+          return;
+        }
+
+        // Si on est en mode interactif, ignorer les prompts et ne garder que les réponses
+        if (isInteractiveMode) {
+          // Ignorer les lignes de prompt et les métadonnées
+          const lines = chunk.split('\n');
+          for (const line of lines) {
+            if (!line.startsWith('>') && 
+                !line.includes('llama_perf_') && 
+                !line.includes('Interrupted') &&
+                !line.match(/^\s*$/) &&
+                !line.includes('<|im_start|>user') &&
+                line.trim().length > 0) {
+              response += line + '\n';
+              chunkCount++;
+            }
+          }
+        } else {
+          // Mode normal
+          response += chunk;
+          chunkCount++;
+        }
 
         logger.debug(`Received chunk ${chunkCount}:`, {
           length: chunk.length,
-          preview: chunk.substring(0, 50)
+          preview: chunk.substring(0, 50),
+          isInteractive: isInteractiveMode
         });
 
         // Vérifier les séquences d'arrêt
@@ -280,12 +313,21 @@ class LlamaService {
         }
       });
 
-      // Traiter la sortie stderr - filtrer les logs verbeux
+      // Pour les modèles avec mode interactif prévu, envoyer le message après un délai
+      if (this.modelInfo?.interactiveMode) {
+        setTimeout(() => {
+          if (llamaProcess.stdin && !isInteractiveMode) {
+            logger.info('Sending message to stdin for interactive model');
+            llamaProcess.stdin.write(fullPrompt + '\n');
+          }
+        }, 1000); // Attendre que le modèle soit prêt
+      }
+
       llamaProcess.stderr?.on('data', (data: Buffer) => {
         const chunk = data.toString();
         errorOutput += chunk;
         
-        // Filtrer les logs de chargement normaux
+        // Filtrer les logs normaux
         if (!chunk.includes('load_tensors:') && 
             !chunk.includes('llama_model_loader:') &&
             !chunk.includes('print_info:') &&
@@ -296,13 +338,12 @@ class LlamaService {
             !chunk.includes('main: chat template') &&
             !chunk.includes('system_info:') &&
             !chunk.trim().match(/^\.+$/)) {
-          logger.warn('llama.cpp stderr:', chunk.substring(0, 100));
+          logger.warn('llama.cpp stderr:', chunk.substring(0, 200));
         }
       });
 
-      // Gérer la fermeture du processus
       llamaProcess.on('close', (code: number | null) => {
-        logger.info('llama.cpp process closed', { code, chunkCount });
+        logger.info('llama.cpp process closed', { code, chunkCount, isInteractive: isInteractiveMode });
         if (!responseSent) {
           const processedResponse = this.processResponse(response);
           if (processedResponse.length > 0) {
@@ -313,13 +354,11 @@ class LlamaService {
         }
       });
 
-      // Gérer les erreurs du processus
       llamaProcess.on('error', (error: Error) => {
         logger.error('llama.cpp process error:', error);
         sendError(`Process error: ${error.message}`);
       });
 
-      // Timeout
       const timeoutId = setTimeout(() => {
         if (!responseSent) {
           logger.warn('llama.cpp timeout reached');
@@ -333,7 +372,6 @@ class LlamaService {
         }
       }, timeout);
 
-      // Nettoyer le timeout à la fermeture
       llamaProcess.on('close', () => {
         clearTimeout(timeoutId);
         this.currentProcess = undefined;
@@ -391,13 +429,13 @@ class LlamaService {
       modelName: activeModel ? activeModel.split('/').pop() : 'None',
       modelType: this.modelInfo?.modelType || 'unknown',
       hasChatTemplate: this.modelInfo?.hasChatTemplate || false,
+      interactiveMode: this.modelInfo?.interactiveMode || false,
       version: 'llama.cpp adaptive',
       lastRequest: new Date(),
       isGenerating: !!this.currentProcess
     };
   }
 
-  // Méthode pour forcer la redétection du modèle
   resetModelInfo(): void {
     this.modelInfo = undefined;
     logger.info('Model info reset, will be detected on next generation');
