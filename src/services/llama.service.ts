@@ -132,14 +132,11 @@ class LlamaService {
       '--no-display-prompt'
     ];
 
-    // Mode conversation pour les modèles avec chat template
-    if (this.modelInfo.hasChatTemplate) {
-      args.push('-cnv'); // Active le mode conversation
-      // Pour les modèles avec chat template, on envoie le message via stdin
-    } else {
-      // Mode prompt classique pour les autres modèles
-      args.push('-p', prompt);
-    }
+    // Pour TOUS les modèles : utiliser le mode prompt avec template intégré
+    args.push('-p', prompt);
+
+    // Désactiver explicitement le mode conversation interactif
+    args.push('--no-cnv');
 
     if (params.seed !== -1) {
       args.push('--seed', params.seed.toString());
@@ -149,30 +146,43 @@ class LlamaService {
   }
 
   private buildPrompt(message: string, preprompt?: string, history?: ChatMessage[]): string {
-    // Si le modèle a un chat template, on laisse llama.cpp le gérer
+    // Construire le prompt avec le template CroissantLLM manuellement
     if (this.modelInfo?.hasChatTemplate) {
-      // Pour les modèles CroissantLLM, on retourne juste le message
-      // Le template sera appliqué automatiquement par llama.cpp
-      return message;
+      let prompt = '';
+      
+      // Ajouter le preprompt comme message système si fourni
+      if (preprompt?.trim()) {
+        prompt += `<|im_start|>system\n${preprompt.trim()}<|im_end|>\n`;
+      }
+
+      // Ajouter l'historique si fourni
+      if (history && history.length > 0) {
+        for (const msg of history.slice(-10)) {
+          const role = msg.role === 'user' ? 'user' : 'assistant';
+          prompt += `<|im_start|>${role}\n${msg.content}<|im_end|>\n`;
+        }
+      }
+
+      // Ajouter le message actuel
+      prompt += `<|im_start|>user\n${message}<|im_end|>\n<|im_start|>assistant\n`;
+      
+      return prompt;
     }
 
     // Pour les modèles sans chat template (Phi-3, etc.)
     let prompt = '';
     
-    // Ajouter le preprompt si fourni
     if (preprompt?.trim()) {
       prompt += `${preprompt.trim()}\n\n`;
     }
 
-    // Ajouter l'historique si fourni
     if (history && history.length > 0) {
-      for (const msg of history.slice(-10)) { // Garder seulement les 10 derniers messages
+      for (const msg of history.slice(-10)) {
         const role = msg.role === 'user' ? 'User' : 'Assistant';
         prompt += `${role}: ${msg.content}\n`;
       }
     }
 
-    // Ajouter le message actuel
     prompt += `User: ${message}\nAssistant:`;
     
     return prompt;
@@ -233,7 +243,7 @@ class LlamaService {
         if (!responseSent) {
           responseSent = true;
           const processingTime = Date.now() - startTime;
-          const tokensUsed = Math.ceil(finalResponse.length / 4); // Estimation approximative
+          const tokensUsed = Math.ceil(finalResponse.length / 4);
           
           resolve({
             response: finalResponse,
@@ -249,18 +259,6 @@ class LlamaService {
           reject(new Error(error));
         }
       };
-
-      // Pour les modèles avec chat template, envoyer le message via stdin
-      if (this.modelInfo?.hasChatTemplate && llamaProcess.stdin) {
-        // Envoyer le message en mode interactif
-        llamaProcess.stdin.write(fullPrompt + '\n');
-        // Attendre un peu puis terminer l'input
-        setTimeout(() => {
-          if (llamaProcess.stdin) {
-            llamaProcess.stdin.end();
-          }
-        }, 100);
-      }
 
       // Traiter la sortie stdout
       llamaProcess.stdout?.on('data', (data: Buffer) => {
@@ -282,16 +280,22 @@ class LlamaService {
         }
       });
 
-      // Traiter la sortie stderr
+      // Traiter la sortie stderr - filtrer les logs verbeux
       llamaProcess.stderr?.on('data', (data: Buffer) => {
         const chunk = data.toString();
         errorOutput += chunk;
         
-        // Filtrer les logs verbeux de llama.cpp
+        // Filtrer les logs de chargement normaux
         if (!chunk.includes('load_tensors:') && 
             !chunk.includes('llama_model_loader:') &&
             !chunk.includes('print_info:') &&
-            !chunk.includes('load_backend:')) {
+            !chunk.includes('load_backend:') &&
+            !chunk.includes('llama_context:') &&
+            !chunk.includes('llama_kv_cache') &&
+            !chunk.includes('main: llama threadpool') &&
+            !chunk.includes('main: chat template') &&
+            !chunk.includes('system_info:') &&
+            !chunk.trim().match(/^\.+$/)) {
           logger.warn('llama.cpp stderr:', chunk.substring(0, 100));
         }
       });
@@ -393,7 +397,7 @@ class LlamaService {
     };
   }
 
-  // Méthode pour forcer la redétection du modèle (utile lors du changement de modèle)
+  // Méthode pour forcer la redétection du modèle
   resetModelInfo(): void {
     this.modelInfo = undefined;
     logger.info('Model info reset, will be detected on next generation');
