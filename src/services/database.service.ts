@@ -21,15 +21,20 @@ class DatabaseService {
 
   async initialize(): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.db = new sqlite3.Database(this.dbPath, (err) => {
-        if (err) {
-          logger.error('Error opening database:', err);
-          reject(err);
-        } else {
-          logger.info(`Connected to SQLite database at ${this.dbPath}`);
-          this.createTables().then(resolve).catch(reject);
-        }
-      });
+      try {
+        this.db = new sqlite3.Database(this.dbPath, (err) => {
+          if (err) {
+            logger.error('Error opening database:', err);
+            reject(err);
+          } else {
+            logger.info(`Connected to SQLite database at ${this.dbPath}`);
+            this.createTables().then(resolve).catch(reject);
+          }
+        });
+      } catch (error) {
+        logger.error('Database initialization error:', error);
+        reject(error);
+      }
     });
   }
 
@@ -64,49 +69,60 @@ class DatabaseService {
         return;
       }
 
-      this.db.exec(createUsersTable, (err) => {
-        if (err) {
-          reject(err);
-          return;
-        }
-
-        this.db!.exec(createChatHistoryTable, (err) => {
+      this.db.serialize(() => {
+        this.db!.run(createUsersTable, (err) => {
           if (err) {
+            logger.error('Error creating users table:', err);
             reject(err);
-          } else {
-            logger.info('Database tables created successfully');
-            resolve();
+            return;
           }
+        });
+
+        this.db!.run(createChatHistoryTable, (err) => {
+          if (err) {
+            logger.error('Error creating chat_history table:', err);
+            reject(err);
+            return;
+          }
+          logger.info('Database tables created successfully');
+          resolve();
         });
       });
     });
   }
 
   async createUser(userData: RegisterRequest): Promise<User> {
-    const hashedPassword = await bcrypt.hash(userData.password, 10);
-    
-    return new Promise((resolve, reject) => {
-      if (!this.db) {
-        reject(new Error('Database not initialized'));
-        return;
-      }
-
-      const stmt = this.db.prepare(`
-        INSERT INTO users (email, username, password)
-        VALUES (?, ?, ?)
-      `);
-
-      stmt.run([userData.email, userData.username, hashedPassword], function(err) {
-        if (err) {
-          reject(err);
-        } else {
-          // Récupérer l'utilisateur créé
-          DatabaseService.getInstance().getUserById(this.lastID).then(resolve).catch(reject);
+    try {
+      const hashedPassword = await bcrypt.hash(userData.password, 10);
+      
+      return new Promise((resolve, reject) => {
+        if (!this.db) {
+          reject(new Error('Database not initialized'));
+          return;
         }
-      });
 
-      stmt.finalize();
-    });
+        const stmt = this.db.prepare(`
+          INSERT INTO users (email, username, password)
+          VALUES (?, ?, ?)
+        `);
+
+        stmt.run([userData.email, userData.username, hashedPassword], function(err) {
+          if (err) {
+            logger.error('Error creating user:', err);
+            reject(err);
+          } else {
+            // Récupérer l'utilisateur créé
+            const userId = this.lastID;
+            DatabaseService.getInstance().getUserById(userId).then(resolve).catch(reject);
+          }
+        });
+
+        stmt.finalize();
+      });
+    } catch (error) {
+      logger.error('Error in createUser:', error);
+      throw error;
+    }
   }
 
   async getUserByEmail(email: string): Promise<User | null> {
@@ -121,6 +137,7 @@ class DatabaseService {
         [email],
         (err, row: any) => {
           if (err) {
+            logger.error('Error getting user by email:', err);
             reject(err);
           } else if (row) {
             resolve({
@@ -151,6 +168,7 @@ class DatabaseService {
         [id],
         (err, row: any) => {
           if (err) {
+            logger.error('Error getting user by id:', err);
             reject(err);
           } else if (row) {
             resolve({
@@ -170,7 +188,12 @@ class DatabaseService {
   }
 
   async verifyPassword(plainPassword: string, hashedPassword: string): Promise<boolean> {
-    return bcrypt.compare(plainPassword, hashedPassword);
+    try {
+      return await bcrypt.compare(plainPassword, hashedPassword);
+    } catch (error) {
+      logger.error('Error verifying password:', error);
+      return false;
+    }
   }
 
   async saveChatHistory(userId: number, message: string, response: string, tokensUsed: number, processingTime: number): Promise<void> {
@@ -187,6 +210,7 @@ class DatabaseService {
 
       stmt.run([userId, message, response, tokensUsed, processingTime], function(err) {
         if (err) {
+          logger.error('Error saving chat history:', err);
           reject(err);
         } else {
           resolve();
@@ -194,6 +218,23 @@ class DatabaseService {
       });
 
       stmt.finalize();
+    });
+  }
+
+  async close(): Promise<void> {
+    return new Promise((resolve) => {
+      if (this.db) {
+        this.db.close((err) => {
+          if (err) {
+            logger.error('Error closing database:', err);
+          } else {
+            logger.info('Database connection closed');
+          }
+          resolve();
+        });
+      } else {
+        resolve();
+      }
     });
   }
 }
