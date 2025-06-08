@@ -161,6 +161,18 @@ class ModelService {
 
     this.activeModelPath = modelPath;
     logger.info(`Active model set to: ${filename}`);
+    
+    // Notifier le LlamaService qu'il faut redétecter le modèle
+    try {
+      const { LlamaService } = require('./llama.service');
+      const llamaService = LlamaService.getInstance();
+      if (llamaService && typeof llamaService.resetModelInfo === 'function') {
+        llamaService.resetModelInfo();
+      }
+    } catch (error) {
+      logger.warn('Could not reset LlamaService model info:', error);
+    }
+    
     return true;
   }
 
