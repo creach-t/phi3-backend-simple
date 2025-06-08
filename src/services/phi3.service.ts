@@ -1,16 +1,14 @@
-import { spawn } from 'child_process';
+import { LlamaService, ModelParams } from './llama.service';
+import { PrepromptService } from './preprompt.service';
 import { ChatMessage, ChatRequest, ChatResponse, ModelStatus } from '../types/chat.types';
 import { logger } from '../utils/logger';
 
 class Phi3Service {
   private static instance: Phi3Service;
-  private modelPath: string;
-  private isModelLoaded: boolean = false;
-  private modelProcess: any = null;
+  private llamaService = LlamaService.getInstance();
+  private prepromptService = PrepromptService.getInstance();
 
-  constructor() {
-    this.modelPath = process.env.PHI3_MODEL_PATH || '';
-  }
+  constructor() {}
 
   static getInstance(): Phi3Service {
     if (!Phi3Service.instance) {
@@ -19,87 +17,68 @@ class Phi3Service {
     return Phi3Service.instance;
   }
 
-  async loadModel(): Promise<void> {
+  async generateResponse(request: ChatRequest, prepromptId?: string, modelParams?: Partial<ModelParams>): Promise<ChatResponse> {
     try {
-      logger.info('Loading Phi-3 model...');
-      // Ici vous pouvez ajouter la logique pour charger le modèle Phi-3
-      // Ceci est un exemple simplifié
-      this.isModelLoaded = true;
-      logger.info('Phi-3 model loaded successfully');
-    } catch (error) {
-      logger.error('Failed to load Phi-3 model:', error);
-      throw error;
-    }
-  }
+      // Récupérer le preprompt si fourni
+      let prepromptContent = '';
+      if (prepromptId) {
+        const preprompt = this.prepromptService.getPreprompt(prepromptId);
+        if (preprompt) {
+          prepromptContent = preprompt.content;
+        }
+      } else {
+        // Utiliser le preprompt par défaut
+        const defaultPreprompt = this.prepromptService.getDefaultPreprompt();
+        if (defaultPreprompt) {
+          prepromptContent = defaultPreprompt.content;
+        }
+      }
 
-  async generateResponse(request: ChatRequest): Promise<ChatResponse> {
-    const startTime = Date.now();
+      // Générer la réponse avec llama.cpp
+      const response = await this.llamaService.generateResponse(
+        request,
+        prepromptContent,
+        modelParams
+      );
 
-    if (!this.isModelLoaded) {
-      await this.loadModel();
-    }
+      logger.info('Response generated successfully', {
+        tokens: response.tokensUsed,
+        time: response.processingTime
+      });
 
-    try {
-      // Simulation d'une réponse pour l'exemple
-      // Remplacez ceci par l'appel réel au modèle Phi-3
-      const response = await this.simulateModelResponse(request);
-      
-      const processingTime = Date.now() - startTime;
-      const tokensUsed = this.estimateTokens(request.message + response);
-
-      return {
-        response,
-        tokensUsed,
-        processingTime
-      };
+      return response;
     } catch (error) {
       logger.error('Error generating response:', error);
       throw new Error('Failed to generate response from Phi-3 model');
     }
   }
 
-  private async simulateModelResponse(request: ChatRequest): Promise<string> {
-    // Simulation simple - remplacez par l'appel réel au modèle
-    return new Promise((resolve) => {
-      setTimeout(() => {
-        const responses = [
-          'Je comprends votre question. Voici ma réponse basée sur le modèle Phi-3.',
-          'C\'est une excellente question ! Laissez-moi vous expliquer...',
-          'Basé sur les informations que vous avez fournies, je peux dire que...',
-          'Voici ce que je pense de votre demande...'
-        ];
-        
-        const randomResponse = responses[Math.floor(Math.random() * responses.length)];
-        resolve(`${randomResponse} (En réponse à: "${request.message}")`);
-      }, 500 + Math.random() * 1500); // Simulation du temps de traitement
-    });
-  }
-
-  private estimateTokens(text: string): number {
-    // Estimation approximative: ~4 caractères par token
-    return Math.ceil(text.length / 4);
-  }
-
   getStatus(): ModelStatus {
+    const llamaStatus = this.llamaService.getStatus();
     return {
-      isLoaded: this.isModelLoaded,
-      modelName: 'Phi-3',
-      version: '3.0',
-      lastRequest: new Date()
+      isLoaded: llamaStatus.isLoaded,
+      modelName: llamaStatus.modelName || 'Phi-3',
+      version: '3.0 (via llama.cpp)',
+      lastRequest: llamaStatus.lastRequest
     };
   }
 
-  async unloadModel(): Promise<void> {
+  async testConnection(): Promise<boolean> {
     try {
-      if (this.modelProcess) {
-        this.modelProcess.kill();
-        this.modelProcess = null;
-      }
-      this.isModelLoaded = false;
-      logger.info('Phi-3 model unloaded');
+      return await this.llamaService.testConnection();
     } catch (error) {
-      logger.error('Error unloading model:', error);
+      logger.error('Connection test failed:', error);
+      return false;
     }
+  }
+
+  stopGeneration(): boolean {
+    return this.llamaService.stopGeneration();
+  }
+
+  async unloadModel(): Promise<void> {
+    // Avec llama.cpp, pas besoin de décharger explicitement
+    logger.info('Model unload requested (handled by llama.cpp)');
   }
 }
 
